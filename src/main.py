@@ -37,7 +37,6 @@ def supabase_get(path: str, params=None):
 
 
 def supabase_upsert(path: str, json_body: dict):
-    """UPSERT with service role."""
     headers = {
         "apikey": SUPABASE_SERVICE_ROLE_KEY,
         "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}",
@@ -48,10 +47,14 @@ def supabase_upsert(path: str, json_body: dict):
     resp = requests.post(url, json=json_body, headers=headers)
 
     if resp.status_code >= 300:
-        print("⚠ Supabase UPSERT error:", resp.status_code, resp.text)
+        print("❌ Supabase UPSERT Error:", resp.status_code, resp.text)
         return None
-    return resp.json()
 
+    # SAFE PARSE
+    try:
+        return resp.json()
+    except:
+        return None
 
 # ============================================================
 #   BOT CONFIG LOADING
