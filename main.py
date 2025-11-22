@@ -1,608 +1,253 @@
-from fastapi import FastAPI, Request
-from fastapi.responses import JSONResponse, PlainTextResponse
 import os
-import requests
-from typing import Dict, Any, List
+from typing import Any, Dict, List, Optional
+
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+
+import httpx
+from supabase import create_client, Client
+
+# ==============================
+#  ENVIRONMENT / GLOBAL CLIENTS
+# ==============================
+
+SUPABASE_URL = os.getenv("SUPABASE_URL")
+SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY")  # not anon key
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")  # your Telegram bot token
+
+if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
+    raise RuntimeError("SUPABASE_URL and SUPABASE_SERVICE_ROLE_KEY must be set as env vars on Render")
+
+if not TELEGRAM_BOT_TOKEN:
+    raise RuntimeError("TELEGRAM_BOT_TOKEN must be set as env var on Render")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY)
+
+TELEGRAM_API_BASE = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 
 app = FastAPI()
 
-# ====== ENV VARS ======
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "")
-WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "acspro-verify")
-SUPABASE_URL = os.getenv("SUPABASE_URL", "")
-SUPABASE_SERVICE_ROLE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "")
-
-TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
-
-# ====== SIMPLE IN-MEMORY SESSION (PER CHAT) ======
-SESSIONS: Dict[int, Dict[str, Any]] = {}
+# CORS (you can adjust origins as needed)
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # or your domains
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
-def get_session(chat_id: int) -> Dict[str, Any]:
-    if chat_id not in SESSIONS:
-        SESSIONS[chat_id] = {
-            "state": "IDLE",
-            "cart": [],
-            "pending_field": None,
-            "customer_info": {
-                "name": "",
-                "phone": "",
-                "address": ""
-            }
-        }
-    return SESSIONS[chat_id]
+# ==================================
+#  HELPER: LOAD BOT FROM SUPABASE
+# ==================================
 
-
-# ====== BOT CONFIG / MENU CACHE ======
-RESTAURANT_BOT_ID = "c078648e-d564-48c0-b48d-4cc280a953a7"
-BOT_CONFIG: Dict[str, Any] | None = None
-MENU: List[Dict[str, Any]] = []
-
-
-def fetch_bot_config_from_supabase(bot_id: str) -> Dict[str, Any]:
+def get_bot_from_supabase(bot_id: str) -> Optional[Dict[str, Any]]:
     """
-    Fetch config_json for a single bot from Supabase using service role key.
+    Load bot row (including config_json) from Supabase 'bots' table.
+    bot_id must be a valid UUID string.
     """
-    if not SUPABASE_URL or not SUPABASE_SERVICE_ROLE_KEY:
-        print("⚠ SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY not set.")
-        return {}
-
-    url = SUPABASE_URL.rstrip("/") + "/rest/v1/bots"
-    params = {
-        "id": f"eq.{bot_id}",
-        "select": "config_json"
-    }
-    headers = {
-        "apikey": SUPABASE_SERVICE_ROLE_KEY,
-        "Authorization": f"Bearer {SUPABASE_SERVICE_ROLE_KEY}"
-    }
-
     try:
-        resp = requests.get(url, headers=headers, params=params, timeout=10)
-        if resp.status_code != 200:
-            print("⚠ Supabase error:", resp.status_code, resp.text)
-            return {}
-        rows = resp.json()
-        if not rows:
-            print("⚠ No bot found with id", bot_id)
-            return {}
-        config = rows[0].get("config_json") or {}
-        if not isinstance(config, dict):
-            print("⚠ config_json is not a dict:", config)
-            return {}
-        return config
+        result = (
+            supabase
+            .table("bots")
+            .select("*")
+            .eq("id", bot_id)
+            .single()
+            .execute()
+        )
     except Exception as e:
-        print("⚠ Exception fetching bot config:", e)
-        return {}
+        print("Supabase error while loading bot:", e)
+        return None
+
+    if getattr(result, "error", None):
+        print("Supabase returned error:", result.error)
+        return None
+
+    # supabase-py v2 returns .data
+    return getattr(result, "data", None)
 
 
-def build_menu_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
+# ==================================
+#  HELPER: BUILD MENU TEXT
+# ==================================
+
+def build_menu_text(config: Dict[str, Any]) -> str:
     """
-    Build MENU structure from:
-      1) config['menu'] if present (structured with imageUrl, price, etc.)
-      2) Otherwise, from config['menuItems'] (multiline text)
-
-    MENU structure:
-    [
-      {
-        "id": "category_id",
-        "name": "اسم القسم",
-        "items": [
-          {
-            "id": "item_id",
-            "name": "...",
-            "description": "...",
-            "price": 9.99,
-            "imageUrl": "https://..."
-          }
-        ]
-      }
-    ]
+    Convert restaurant config_json into a nice Telegram text message.
+    Uses:
+      - restaurantName, restaurantTagline
+      - menu (structured) and cartSettings
     """
+    restaurant_name = config.get("restaurantName") or "مطعمك"
+    tagline = config.get("restaurantTagline") or ""
+    phone = config.get("phoneNumber") or ""
+    address = config.get("address") or ""
+    opening = config.get("openingHours") or ""
+    delivery = config.get("deliveryOptions") or ""
 
-    # --- Case 1: structured menu in config['menu'] ---
-    structured_menu = config.get("menu")
-    if isinstance(structured_menu, list) and structured_menu:
-        # If it's already in category form (has 'items' on elements), use as is
-        if all(isinstance(c, dict) and "items" in c for c in structured_menu):
-            # Normalize categories & items
-            normalized_categories: List[Dict[str, Any]] = []
-            for cat_idx, cat in enumerate(structured_menu, start=1):
-                cat_id = cat.get("id") or f"cat_{cat_idx}"
-                cat_name = cat.get("name") or "قسم"
-                raw_items = cat.get("items") or []
-                norm_items = []
-                for idx, it in enumerate(raw_items, start=1):
-                    item_id = it.get("id") or f"{cat_id}_item_{idx}"
-                    norm_items.append({
-                        "id": item_id,
-                        "name": it.get("name", f"صنف {idx}"),
-                        "description": it.get("description", "لا يوجد وصف بعد."),
-                        "price": float(it.get("price", 0.0) or 0.0),
-                        "imageUrl": it.get("imageUrl", "")
-                    })
-                normalized_categories.append({
-                    "id": cat_id,
-                    "name": cat_name,
-                    "items": norm_items
-                })
-            return normalized_categories
+    cart = config.get("cartSettings") or {}
+    currency = cart.get("currency") or "USD"
 
-        # Otherwise, assume it's a flat list of items
-        items: List[Dict[str, Any]] = []
-        for idx, it in enumerate(structured_menu, start=1):
-            if not isinstance(it, dict):
-                continue
-            item_id = it.get("id") or f"item_{idx}"
-            items.append({
-                "id": item_id,
-                "name": it.get("name", f"صنف {idx}"),
-                "description": it.get("description", "لا يوجد وصف بعد."),
-                "price": float(it.get("price", 0.0) or 0.0),
-                "imageUrl": it.get("imageUrl", "")
-            })
+    lines: List[str] = []
 
-        if items:
-            return [
-                {
-                    "id": "main_menu",
-                    "name": "قائمة الطعام",
-                    "items": items
-                }
-            ]
+    # Header
+    lines.append(f"🍽️ *{restaurant_name}*")
+    if tagline:
+        lines.append(f"_{tagline}_")
+    if phone or address:
+        contact_line = []
+        if phone:
+            contact_line.append(f"📞 {phone}")
+        if address:
+            contact_line.append(f"📍 {address}")
+        lines.append(" • ".join(contact_line))
+    if opening:
+        lines.append(f"⏰ {opening}")
+    if delivery:
+        lines.append(f"🚚 {delivery}")
 
-    # --- Case 2: fallback to multiline text menuItems ---
-    menu_items_raw = config.get("menuItems", "") or ""
-    lines = [line.strip() for line in menu_items_raw.splitlines() if line.strip()]
+    lines.append("")  # empty line
 
-    items: List[Dict[str, Any]] = []
-
-    for idx, line in enumerate(lines):
-        name = line
-        description = ""
-        price = 0.0
-
-        # Try to split using Arabic dash or normal dash
-        if "–" in line:
-            name_part, rest = line.split("–", 1)
-            name = name_part.strip()
-            rest = rest.strip()
-        elif "-" in line:
-            name_part, rest = line.split("-", 1)
-            name = name_part.strip()
-            rest = rest.strip()
+    # Menu
+    menu = config.get("menu") or []
+    if not menu:
+        # fallback to simple menuItems text if present
+        menu_items_raw = (config.get("menuItems") or "").strip()
+        if menu_items_raw:
+            lines.append("📖 *المنيو:*")
+            lines.append(menu_items_raw)
         else:
-            rest = ""
+            lines.append("لا يوجد منيو محفوظ بعد في هذا البوت.")
+    else:
+        lines.append("📖 *المنيو:*")
+        for category in menu:
+            cat_name = category.get("name") or "قسم بدون اسم"
+            lines.append(f"\n📂 *{cat_name}*")
+            for item in category.get("items", []):
+                item_name = item.get("name") or "طبق بدون اسم"
+                desc = item.get("description") or ""
+                price_val = item.get("price") or 0
+                if price_val and price_val > 0:
+                    price = f"{price_val:.2f} {currency}"
+                else:
+                    price = "حسب الطلب"
 
-        # Try to parse price if present
-        if rest:
-            if "حسب" in rest:
-                price = 0.0
-                description = "السعر حسب الطلب."
-            else:
-                amount_part = rest.split("$")[0].strip()
-                try:
-                    price = float(amount_part)
-                except ValueError:
-                    price = 0.0
-                description = rest
+                lines.append(f"• {item_name} – {price}")
+                if desc:
+                    lines.append(f"  _{desc}_")
 
-        item_id = f"item_{idx+1}"
-        items.append({
-            "id": item_id,
-            "name": name,
-            "description": description or "لا يوجد وصف بعد.",
-            "price": price,
-            "imageUrl": ""
-        })
+    # Cart info
+    if cart.get("enabled"):
+        lines.append("\n🧺 *نظام السلة مفعّل*")
+        min_order = cart.get("minOrder") or 0
+        max_items = cart.get("maxItems") or 0
 
-    if not items:
-        items = [
-            {
-                "id": "demo_item",
-                "name": "عنصر تجريبي",
-                "description": "هذا عنصر تجريبي لأن المنيو غير مهيّأ بعد.",
-                "price": 0.0,
-                "imageUrl": ""
-            }
-        ]
-
-    return [
-        {
-            "id": "main_menu",
-            "name": "قائمة الطعام",
-            "items": items
-        }
-    ]
-
-
-def ensure_bot_menu_loaded():
-    """
-    Ensure BOT_CONFIG and MENU are loaded from Supabase once.
-    """
-    global BOT_CONFIG, MENU
-    if BOT_CONFIG is not None and MENU:
-        return
-
-    print("ℹ Loading restaurant bot config from Supabase...")
-    BOT_CONFIG = fetch_bot_config_from_supabase(RESTAURANT_BOT_ID)
-    MENU = build_menu_from_config(BOT_CONFIG)
-
-
-def find_category(cat_id: str):
-    for c in MENU:
-        if c["id"] == cat_id:
-            return c
-    return None
-
-
-def find_item(item_id: str):
-    for c in MENU:
-        for it in c["items"]:
-            if it["id"] == item_id:
-                return it
-    return None
-
-
-# ====== TELEGRAM HELPERS ======
-def tg_send_message(chat_id: int, text: str, reply_markup: dict | None = None):
-    if not TELEGRAM_BOT_TOKEN:
-        print("⚠ TELEGRAM_BOT_TOKEN is missing.")
-        return
-
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "text": text,
-        "parse_mode": "HTML"
-    }
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    try:
-        r = requests.post(f"{TELEGRAM_API_URL}/sendMessage", json=payload)
-        if r.status_code != 200:
-            print("Telegram sendMessage error:", r.text)
-    except Exception as e:
-        print("Telegram sendMessage exception:", e)
-
-
-def tg_send_photo(chat_id: int, photo_url: str, caption: str = "", reply_markup: dict | None = None):
-    """
-    Send a photo with optional caption and inline keyboard.
-    """
-    if not TELEGRAM_BOT_TOKEN:
-        print("⚠ TELEGRAM_BOT_TOKEN is missing.")
-        return
-
-    payload: Dict[str, Any] = {
-        "chat_id": chat_id,
-        "photo": photo_url,
-    }
-    if caption:
-        payload["caption"] = caption
-        payload["parse_mode"] = "HTML"
-    if reply_markup:
-        payload["reply_markup"] = reply_markup
-
-    try:
-        r = requests.post(f"{TELEGRAM_API_URL}/sendPhoto", json=payload)
-        if r.status_code != 200:
-            print("Telegram sendPhoto error:", r.text)
-    except Exception as e:
-        print("Telegram sendPhoto exception:", e)
-
-
-def main_menu_keyboard():
-    return {
-        "keyboard": [
-            [
-                {"text": "🧾 عرض المنيو"},
-                {"text": "🛒 عرض السلة"}
-            ],
-            [
-                {"text": "❌ إفراغ السلة"}
-            ]
-        ],
-        "resize_keyboard": True
-    }
-
-
-def categories_keyboard():
-    buttons = []
-    for cat in MENU:
-        buttons.append([{"text": f"{cat['name']}", "callback_data": f"CAT:{cat['id']}"}])
-
-    return {
-        "inline_keyboard": buttons + [
-            [{"text": "🔙 رجوع للقائمة الرئيسية", "callback_data": "BACK:MAIN"}]
-        ]
-    }
-
-
-def checkout_keyboard():
-    return {
-        "inline_keyboard": [
-            [{"text": "✅ تأكيد الطلب", "callback_data": "CHECKOUT:CONFIRM"}],
-            [{"text": "🔙 متابعة التصفح", "callback_data": "BACK:MAIN"}],
-            [{"text": "❌ إفراغ السلة", "callback_data": "CART:CLEAR"}]
-        ]
-    }
-
-
-# ====== CART / ORDER HELPERS ======
-def format_cart(cart: List[Dict[str, Any]]) -> str:
-    if not cart:
-        return "السلة فارغة حالياً."
-
-    lines = []
-    total = 0.0
-    for item in cart:
-        item_total = item["price"] * item["qty"]
-        total += item_total
-        if item["price"] > 0:
-            price_part = f"{item['price']:.2f}$"
-            item_total_part = f"{item_total:.2f}$"
+        if min_order and min_order > 0:
+            lines.append(f"الحد الأدنى للطلب: {min_order:.2f} {currency}")
         else:
-            price_part = "حسب الطلب"
-            item_total_part = ""
-        lines.append(f"• {item['name']} × {item['qty']} – {price_part} {item_total_part}")
+            lines.append("لا يوجد حد أدنى للطلب.")
 
-    lines.append("\nالإجمالي التقريبي: {:.2f}$".format(total))
+        if max_items and max_items > 0:
+            lines.append(f"أقصى عدد للعناصر في السلة: {max_items}")
+    else:
+        lines.append("\n🧺 السلة غير مفعّلة – سيتم تنفيذ الطلب على شكل طبق واحد في كل مرة.")
+
+    lines.append("")
+    lines.append("✉️ أرسل كلمة *طلب* أو اسم الطبق لبدء طلب جديد.")
+
     return "\n".join(lines)
 
 
-# ====== ROOT ======
+# ==================================
+#  HELPER: SEND MESSAGE TO TELEGRAM
+# ==================================
+
+async def telegram_send_message(chat_id: int, text: str, parse_mode: str = "Markdown") -> None:
+    """
+    Send a text message back to Telegram.
+    """
+    url = f"{TELEGRAM_API_BASE}/sendMessage"
+    payload = {
+        "chat_id": chat_id,
+        "text": text,
+        "parse_mode": parse_mode,
+    }
+
+    async with httpx.AsyncClient(timeout=10.0) as client:
+        try:
+            resp = await client.post(url, json=payload)
+            if resp.status_code != 200:
+                print("Telegram sendMessage error:", resp.status_code, resp.text)
+        except Exception as e:
+            print("Exception sending Telegram message:", e)
+
+
+# ==================================
+#  TELEGRAM WEBHOOK ENDPOINT
+#  URL: /api/telegram-webhook/{bot_id}
+#  bot_id = UUID from Supabase bots table
+# ==================================
+
+@app.post("/api/telegram-webhook/{bot_id}")
+async def telegram_webhook(bot_id: str, request: Request):
+    """
+    Telegram will POST updates here.
+    We use bot_id (from URL) to know which restaurant bot config to use.
+    """
+    try:
+        update = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON")
+
+    # Telegram sends either "message" or "edited_message"
+    message = update.get("message") or update.get("edited_message")
+    if not message:
+        # Could be callback_query, etc. For now just ignore.
+        return {"ok": True}
+
+    chat = message.get("chat") or {}
+    chat_id = chat.get("id")
+    text = (message.get("text") or "").strip()
+
+    if not chat_id:
+        return {"ok": True}
+
+    # 1) Load bot config from Supabase
+    bot_row = get_bot_from_supabase(bot_id)
+    if not bot_row:
+        await telegram_send_message(chat_id, "❌ لم يتم العثور على هذا البوت في النظام.")
+        return {"ok": True}
+
+    config = bot_row.get("config_json") or {}
+    restaurant_name = config.get("restaurantName") or "مطعمك"
+
+    # 2) Determine reply based on text
+    lowered = text.lower()
+
+    if lowered in ["/start", "start", "menu", "المنيو", "منيو", "قائمة الطعام"]:
+        reply = build_menu_text(config)
+    elif lowered in ["hi", "hello", "مرحبا", "السلام عليكم"]:
+        reply = (
+            f"مرحباً 👋 معك المساعد الذكي لمطعم *{restaurant_name}*.\n\n"
+            "اكتب كلمة *المنيو* لعرض قائمة الطعام، أو أرسل اسم الطبق مباشرة لبدء الطلب."
+        )
+    else:
+        # simple fallback – later you can plug in full NLP / Dialogflow, etc.
+        reply = (
+            f"تلقيت رسالتك: _{text}_\n\n"
+            "لرؤية قائمة الطعام أرسل كلمة *المنيو*.\n"
+            "أو اكتب اسم الطبق الذي تريده."
+        )
+
+    # 3) Send reply
+    await telegram_send_message(chat_id, reply)
+    return {"ok": True}
+
+
+# ==========================
+#  SIMPLE HEALTH CHECK
+# ==========================
+
 @app.get("/")
 async def root():
-    return PlainTextResponse("ACS PRO Backend is running.")
-
-
-# ====== WHATSAPP WEBHOOK VERIFY (kept for later use) ======
-@app.get("/webhook")
-async def whatsapp_verify(request: Request):
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-        return PlainTextResponse(challenge)
-    return JSONResponse({"error": "Verification failed"}, status_code=403)
-
-
-@app.post("/webhook")
-async def whatsapp_webhook_handler(request: Request):
-    body = await request.json()
-    print("Incoming WhatsApp Message:", body)
-    return JSONResponse({"status": "received"})
-
-
-# ====== TELEGRAM WEBHOOK ======
-@app.post("/telegram-webhook")
-async def telegram_webhook(request: Request):
-    update = await request.json()
-    print("Incoming Telegram update:", update)
-
-    ensure_bot_menu_loaded()
-
-    if "message" in update:
-        await handle_telegram_message(update["message"])
-    if "callback_query" in update:
-        await handle_telegram_callback(update["callback_query"])
-
-    return JSONResponse({"ok": True})
-
-
-async def handle_telegram_message(message: Dict[str, Any]):
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return
-
-    text = message.get("text", "").strip()
-    session = get_session(chat_id)
-
-    # Get restaurant info from config
-    restaurant_name = BOT_CONFIG.get("restaurantName", "مطعمك") if BOT_CONFIG else "مطعمك"
-    tagline = BOT_CONFIG.get("restaurantTagline", "") if BOT_CONFIG else ""
-    opening_hours = BOT_CONFIG.get("openingHours", "") if BOT_CONFIG else ""
-
-    if text == "/start":
-        session["state"] = "IDLE"
-        session["cart"] = []
-        session["pending_field"] = None
-        session["customer_info"] = {"name": "", "phone": "", "address": ""}
-
-        welcome_lines = [
-            f"👋 أهلاً بك في <b>{restaurant_name}</b>!"
-        ]
-        if tagline:
-            welcome_lines.append(f"✨ {tagline}")
-        welcome_lines.append("")
-        welcome_lines.append("يمكنك الإطلاع على المنيو، إضافة الطلبات إلى السلة، ثم تأكيد الطلب مباشرة من هنا.")
-        if opening_hours:
-            welcome_lines.append("")
-            welcome_lines.append(f"⏰ أوقات العمل: {opening_hours}")
-        welcome_lines.append("")
-        welcome_lines.append("اختر ما تريد من الأزرار بالأسفل 👇")
-
-        welcome = "\n".join(welcome_lines)
-        tg_send_message(chat_id, welcome, reply_markup=main_menu_keyboard())
-        return
-
-    if session["state"] == "ASK_NAME":
-        session["customer_info"]["name"] = text
-        session["state"] = "ASK_PHONE"
-        tg_send_message(chat_id, "📞 ممتاز، الآن اكتب رقم الجوال للتواصل معك:")
-        return
-
-    if session["state"] == "ASK_PHONE":
-        session["customer_info"]["phone"] = text
-        session["state"] = "ASK_ADDRESS"
-        tg_send_message(chat_id, "📍 اكتب العنوان أو أقرب نقطة دلالة (والتعليمات الخاصة إن وجدت):")
-        return
-
-    if session["state"] == "ASK_ADDRESS":
-        session["customer_info"]["address"] = text
-        session["state"] = "IDLE"
-
-        cart_text = format_cart(session["cart"])
-        info = session["customer_info"]
-        summary = (
-            "✅ تم استلام بيانات الطلب:\n\n"
-            f"{cart_text}\n\n"
-            "👤 الاسم: {name}\n"
-            "📞 الجوال: {phone}\n"
-            "📍 العنوان: {address}\n\n"
-            "سيتم التواصل معك قريباً لتأكيد الطلب، شكراً لاختيارك 🤍"
-        ).format(
-            name=info["name"],
-            phone=info["phone"],
-            address=info["address"]
-        )
-        tg_send_message(chat_id, summary, reply_markup=main_menu_keyboard())
-        return
-
-    if text == "🧾 عرض المنيو":
-        tg_send_message(
-            chat_id,
-            "اختر القسم الذي تريد استعراضه من المنيو:",
-            reply_markup=categories_keyboard()
-        )
-        return
-
-    if text == "🛒 عرض السلة":
-        cart_text = format_cart(session["cart"])
-        tg_send_message(
-            chat_id,
-            "🛒 <b>سلتك الحالية:</b>\n\n" + cart_text,
-            reply_markup=checkout_keyboard() if session["cart"] else main_menu_keyboard()
-        )
-        return
-
-    if text == "❌ إفراغ السلة":
-        session["cart"] = []
-        tg_send_message(chat_id, "✅ تم إفراغ السلة.", reply_markup=main_menu_keyboard())
-        return
-
-    tg_send_message(
-        chat_id,
-        "يمكنك استخدام الأزرار بالأسفل للتعامل مع المنيو والسلة 👇",
-        reply_markup=main_menu_keyboard()
-    )
-
-
-async def handle_telegram_callback(callback: Dict[str, Any]):
-    message = callback.get("message", {})
-    chat = message.get("chat", {})
-    chat_id = chat.get("id")
-    if chat_id is None:
-        return
-
-    data = callback.get("data", "")
-    session = get_session(chat_id)
-
-    if data.startswith("CAT:"):
-        cat_id = data.split(":", 1)[1]
-        cat = find_category(cat_id)
-        if not cat:
-            tg_send_message(chat_id, "⚠ لم يتم العثور على هذا القسم.")
-            return
-
-        # Header text
-        tg_send_message(
-            chat_id,
-            f"📂 <b>{cat['name']}</b>\n\nتصفح الأطباق بالأسفل ثم أضف ما تريد إلى السلة:"
-        )
-
-        # For each item in this category, send image (if present) or text-only
-        for it in cat["items"]:
-            price_part = f"{it['price']:.2f}$" if it["price"] > 0 else "حسب الطلب"
-            caption = (
-                f"<b>{it['name']}</b>\n"
-                f"{it['description']}\n"
-                f"💰 السعر: {price_part}"
-            )
-
-            keyboard = {
-                "inline_keyboard": [
-                    [
-                        {
-                            "text": f"➕ إضافة {it['name']}",
-                            "callback_data": f"ADD:{it['id']}"
-                        }
-                    ]
-                ]
-            }
-
-            if it.get("imageUrl"):
-                tg_send_photo(chat_id, it["imageUrl"], caption=caption, reply_markup=keyboard)
-            else:
-                # Fallback to text-only message with inline button
-                tg_send_message(chat_id, caption, reply_markup=keyboard)
-
-        # After listing items, show a shortcut back
-        tg_send_message(
-            chat_id,
-            "يمكنك الرجوع للأقسام أو عرض السلة في أي وقت.",
-            reply_markup=categories_keyboard()
-        )
-        return
-
-    if data.startswith("ADD:"):
-        item_id = data.split(":", 1)[1]
-        item = find_item(item_id)
-        if not item:
-            tg_send_message(chat_id, "⚠ لم يتم العثور على هذا الصنف.")
-            return
-
-        found = False
-        for c_item in session["cart"]:
-            if c_item["id"] == item_id:
-                c_item["qty"] += 1
-                found = True
-                break
-
-        if not found:
-            session["cart"].append({
-                "id": item_id,
-                "name": item["name"],
-                "price": item["price"],
-                "qty": 1
-            })
-
-        tg_send_message(
-            chat_id,
-            f"✅ تمت إضافة \"{item['name']}\" إلى السلة.",
-            reply_markup=main_menu_keyboard()
-        )
-        return
-
-    if data == "BACK:MAIN":
-        tg_send_message(
-            chat_id,
-            "رجعناك للقائمة الرئيسية 👇",
-            reply_markup=main_menu_keyboard()
-        )
-        return
-
-    if data == "BACK:CATS":
-        tg_send_message(
-            chat_id,
-            "اختر القسم الذي تريد استعراضه:",
-            reply_markup=categories_keyboard()
-        )
-        return
-
-    if data == "CART:CLEAR":
-        session["cart"] = []
-        tg_send_message(chat_id, "✅ تم إفراغ السلة.", reply_markup=main_menu_keyboard())
-        return
-
-    if data == "CHECKOUT:CONFIRM":
-        if not session["cart"]:
-            tg_send_message(chat_id, "السلة فارغة، أضف بعض الطلبات أولاً.", reply_markup=main_menu_keyboard())
-            return
-
-        session["state"] = "ASK_NAME"
-        tg_send_message(chat_id, "🧾 رائع! قبل تأكيد الطلب، اكتب اسمك الكامل:")
-        return
+    return {"status": "ok", "service": "ACS PRO backend", "telegram": True}
