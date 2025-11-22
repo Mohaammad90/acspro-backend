@@ -17,6 +17,7 @@ TELEGRAM_API_URL = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}"
 # ====== SIMPLE IN-MEMORY SESSION (PER CHAT) ======
 SESSIONS: Dict[int, Dict[str, Any]] = {}
 
+
 def get_session(chat_id: int) -> Dict[str, Any]:
     if chat_id not in SESSIONS:
         SESSIONS[chat_id] = {
@@ -31,10 +32,12 @@ def get_session(chat_id: int) -> Dict[str, Any]:
         }
     return SESSIONS[chat_id]
 
+
 # ====== BOT CONFIG / MENU CACHE ======
 RESTAURANT_BOT_ID = "c078648e-d564-48c0-b48d-4cc280a953a7"
 BOT_CONFIG: Dict[str, Any] | None = None
 MENU: List[Dict[str, Any]] = []
+
 
 def fetch_bot_config_from_supabase(bot_id: str) -> Dict[str, Any]:
     """
@@ -72,14 +75,83 @@ def fetch_bot_config_from_supabase(bot_id: str) -> Dict[str, Any]:
         print("⚠ Exception fetching bot config:", e)
         return {}
 
+
 def build_menu_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
     """
-    Build MENU structure from config_json.menuItems.
-    For now, we create a single category 'قائمة الطعام' with parsed items.
-    Each line in menuItems is like:
-      شاورما دجاج – 9.99$
-      منسف – حسب الطلب
+    Build MENU structure from:
+      1) config['menu'] if present (structured with imageUrl, price, etc.)
+      2) Otherwise, from config['menuItems'] (multiline text)
+
+    MENU structure:
+    [
+      {
+        "id": "category_id",
+        "name": "اسم القسم",
+        "items": [
+          {
+            "id": "item_id",
+            "name": "...",
+            "description": "...",
+            "price": 9.99,
+            "imageUrl": "https://..."
+          }
+        ]
+      }
+    ]
     """
+
+    # --- Case 1: structured menu in config['menu'] ---
+    structured_menu = config.get("menu")
+    if isinstance(structured_menu, list) and structured_menu:
+        # If it's already in category form (has 'items' on elements), use as is
+        if all(isinstance(c, dict) and "items" in c for c in structured_menu):
+            # Normalize categories & items
+            normalized_categories: List[Dict[str, Any]] = []
+            for cat_idx, cat in enumerate(structured_menu, start=1):
+                cat_id = cat.get("id") or f"cat_{cat_idx}"
+                cat_name = cat.get("name") or "قسم"
+                raw_items = cat.get("items") or []
+                norm_items = []
+                for idx, it in enumerate(raw_items, start=1):
+                    item_id = it.get("id") or f"{cat_id}_item_{idx}"
+                    norm_items.append({
+                        "id": item_id,
+                        "name": it.get("name", f"صنف {idx}"),
+                        "description": it.get("description", "لا يوجد وصف بعد."),
+                        "price": float(it.get("price", 0.0) or 0.0),
+                        "imageUrl": it.get("imageUrl", "")
+                    })
+                normalized_categories.append({
+                    "id": cat_id,
+                    "name": cat_name,
+                    "items": norm_items
+                })
+            return normalized_categories
+
+        # Otherwise, assume it's a flat list of items
+        items: List[Dict[str, Any]] = []
+        for idx, it in enumerate(structured_menu, start=1):
+            if not isinstance(it, dict):
+                continue
+            item_id = it.get("id") or f"item_{idx}"
+            items.append({
+                "id": item_id,
+                "name": it.get("name", f"صنف {idx}"),
+                "description": it.get("description", "لا يوجد وصف بعد."),
+                "price": float(it.get("price", 0.0) or 0.0),
+                "imageUrl": it.get("imageUrl", "")
+            })
+
+        if items:
+            return [
+                {
+                    "id": "main_menu",
+                    "name": "قائمة الطعام",
+                    "items": items
+                }
+            ]
+
+    # --- Case 2: fallback to multiline text menuItems ---
     menu_items_raw = config.get("menuItems", "") or ""
     lines = [line.strip() for line in menu_items_raw.splitlines() if line.strip()]
 
@@ -104,13 +176,10 @@ def build_menu_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
 
         # Try to parse price if present
         if rest:
-            # e.g. "9.99$" or "10$"
-            # or "حسب الطلب"
             if "حسب" in rest:
                 price = 0.0
                 description = "السعر حسب الطلب."
             else:
-                # extract numeric part before $
                 amount_part = rest.split("$")[0].strip()
                 try:
                     price = float(amount_part)
@@ -123,17 +192,18 @@ def build_menu_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "id": item_id,
             "name": name,
             "description": description or "لا يوجد وصف بعد.",
-            "price": price
+            "price": price,
+            "imageUrl": ""
         })
 
     if not items:
-        # fallback demo items if config has no menu
         items = [
             {
                 "id": "demo_item",
                 "name": "عنصر تجريبي",
                 "description": "هذا عنصر تجريبي لأن المنيو غير مهيّأ بعد.",
-                "price": 0.0
+                "price": 0.0,
+                "imageUrl": ""
             }
         ]
 
@@ -144,6 +214,7 @@ def build_menu_from_config(config: Dict[str, Any]) -> List[Dict[str, Any]]:
             "items": items
         }
     ]
+
 
 def ensure_bot_menu_loaded():
     """
@@ -157,11 +228,13 @@ def ensure_bot_menu_loaded():
     BOT_CONFIG = fetch_bot_config_from_supabase(RESTAURANT_BOT_ID)
     MENU = build_menu_from_config(BOT_CONFIG)
 
+
 def find_category(cat_id: str):
     for c in MENU:
         if c["id"] == cat_id:
             return c
     return None
+
 
 def find_item(item_id: str):
     for c in MENU:
@@ -169,6 +242,7 @@ def find_item(item_id: str):
             if it["id"] == item_id:
                 return it
     return None
+
 
 # ====== TELEGRAM HELPERS ======
 def tg_send_message(chat_id: int, text: str, reply_markup: dict | None = None):
@@ -191,6 +265,33 @@ def tg_send_message(chat_id: int, text: str, reply_markup: dict | None = None):
     except Exception as e:
         print("Telegram sendMessage exception:", e)
 
+
+def tg_send_photo(chat_id: int, photo_url: str, caption: str = "", reply_markup: dict | None = None):
+    """
+    Send a photo with optional caption and inline keyboard.
+    """
+    if not TELEGRAM_BOT_TOKEN:
+        print("⚠ TELEGRAM_BOT_TOKEN is missing.")
+        return
+
+    payload: Dict[str, Any] = {
+        "chat_id": chat_id,
+        "photo": photo_url,
+    }
+    if caption:
+        payload["caption"] = caption
+        payload["parse_mode"] = "HTML"
+    if reply_markup:
+        payload["reply_markup"] = reply_markup
+
+    try:
+        r = requests.post(f"{TELEGRAM_API_URL}/sendPhoto", json=payload)
+        if r.status_code != 200:
+            print("Telegram sendPhoto error:", r.text)
+    except Exception as e:
+        print("Telegram sendPhoto exception:", e)
+
+
 def main_menu_keyboard():
     return {
         "keyboard": [
@@ -205,6 +306,7 @@ def main_menu_keyboard():
         "resize_keyboard": True
     }
 
+
 def categories_keyboard():
     buttons = []
     for cat in MENU:
@@ -216,26 +318,6 @@ def categories_keyboard():
         ]
     }
 
-def items_keyboard(cat_id: str):
-    cat = find_category(cat_id)
-    if not cat:
-        return {"inline_keyboard": [[{"text": "🔙 رجوع", "callback_data": "BACK:CATS"}]]}
-
-    rows = []
-    for it in cat["items"]:
-        if it["price"] > 0:
-            label = f"{it['name']} – {it['price']:.2f}$"
-        else:
-            label = f"{it['name']} – حسب الطلب"
-        rows.append([
-            {"text": f"➕ {label}", "callback_data": f"ADD:{it['id']}"}
-        ])
-
-    rows.append([{"text": "🔙 رجوع للأقسام", "callback_data": "BACK:CATS"}])
-
-    return {
-        "inline_keyboard": rows
-    }
 
 def checkout_keyboard():
     return {
@@ -245,6 +327,7 @@ def checkout_keyboard():
             [{"text": "❌ إفراغ السلة", "callback_data": "CART:CLEAR"}]
         ]
     }
+
 
 # ====== CART / ORDER HELPERS ======
 def format_cart(cart: List[Dict[str, Any]]) -> str:
@@ -267,10 +350,12 @@ def format_cart(cart: List[Dict[str, Any]]) -> str:
     lines.append("\nالإجمالي التقريبي: {:.2f}$".format(total))
     return "\n".join(lines)
 
+
 # ====== ROOT ======
 @app.get("/")
 async def root():
     return PlainTextResponse("ACS PRO Backend is running.")
+
 
 # ====== WHATSAPP WEBHOOK VERIFY (kept for later use) ======
 @app.get("/webhook")
@@ -283,11 +368,13 @@ async def whatsapp_verify(request: Request):
         return PlainTextResponse(challenge)
     return JSONResponse({"error": "Verification failed"}, status_code=403)
 
+
 @app.post("/webhook")
 async def whatsapp_webhook_handler(request: Request):
     body = await request.json()
     print("Incoming WhatsApp Message:", body)
     return JSONResponse({"status": "received"})
+
 
 # ====== TELEGRAM WEBHOOK ======
 @app.post("/telegram-webhook")
@@ -303,6 +390,7 @@ async def telegram_webhook(request: Request):
         await handle_telegram_callback(update["callback_query"])
 
     return JSONResponse({"ok": True})
+
 
 async def handle_telegram_message(message: Dict[str, Any]):
     chat = message.get("chat", {})
@@ -402,6 +490,7 @@ async def handle_telegram_message(message: Dict[str, Any]):
         reply_markup=main_menu_keyboard()
     )
 
+
 async def handle_telegram_callback(callback: Dict[str, Any]):
     message = callback.get("message", {})
     chat = message.get("chat", {})
@@ -419,19 +508,43 @@ async def handle_telegram_callback(callback: Dict[str, Any]):
             tg_send_message(chat_id, "⚠ لم يتم العثور على هذا القسم.")
             return
 
-        lines = [f"📂 <b>{cat['name']}</b>\n"]
-        for it in cat["items"]:
-            if it["price"] > 0:
-                price_part = f"{it['price']:.2f}$"
-            else:
-                price_part = "حسب الطلب"
-            lines.append(f"• <b>{it['name']}</b> – {price_part}\n  {it['description']}")
-        text = "\n".join(lines)
-
+        # Header text
         tg_send_message(
             chat_id,
-            text,
-            reply_markup=items_keyboard(cat_id)
+            f"📂 <b>{cat['name']}</b>\n\nتصفح الأطباق بالأسفل ثم أضف ما تريد إلى السلة:"
+        )
+
+        # For each item in this category, send image (if present) or text-only
+        for it in cat["items"]:
+            price_part = f"{it['price']:.2f}$" if it["price"] > 0 else "حسب الطلب"
+            caption = (
+                f"<b>{it['name']}</b>\n"
+                f"{it['description']}\n"
+                f"💰 السعر: {price_part}"
+            )
+
+            keyboard = {
+                "inline_keyboard": [
+                    [
+                        {
+                            "text": f"➕ إضافة {it['name']}",
+                            "callback_data": f"ADD:{it['id']}"
+                        }
+                    ]
+                ]
+            }
+
+            if it.get("imageUrl"):
+                tg_send_photo(chat_id, it["imageUrl"], caption=caption, reply_markup=keyboard)
+            else:
+                # Fallback to text-only message with inline button
+                tg_send_message(chat_id, caption, reply_markup=keyboard)
+
+        # After listing items, show a shortcut back
+        tg_send_message(
+            chat_id,
+            "يمكنك الرجوع للأقسام أو عرض السلة في أي وقت.",
+            reply_markup=categories_keyboard()
         )
         return
 
