@@ -99,3 +99,4 @@ def send_telegram_message(chat_id, text):
 @app.get("/")
 async def home():
     return {"status": "ACS PRO backend running"}
+
